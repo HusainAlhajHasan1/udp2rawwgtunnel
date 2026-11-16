@@ -136,3 +136,9 @@ This guarded recovery is only for that partial installation: it refuses to run
 if a dashboard database or service already exists, and it does not rebuild or
 restart the tunnel. Enter a dashboard admin password when prompted. If the guard
 refuses, inspect the existing dashboard state instead of deleting its data.
+
+## Optional WebSocket transport trial
+
+See [WSTUNNEL-TRIAL.md](WSTUNNEL-TRIAL.md). The trial needs a DNS-only TLS
+name, an existing trusted certificate, and a separate port. It is not tested
+against the live VPSs and does not replace or disable the original tunnel.
