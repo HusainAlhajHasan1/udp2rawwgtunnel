@@ -126,3 +126,13 @@ Do not restore a full iptables snapshot blindly: it can disrupt Docker, udp2raw,
 SSH and other live services. `udp2raw-relay`, `wgrelay0`, `wg1` and `wgvpn0`
 are not intentionally stopped. If anything unexpected happens, stop and use
 the provider console to diagnose rather than repeatedly running the installer.
+
+### Recovery from the dashboard Python import error
+
+If the middle installer stopped at `ModuleNotFoundError: No module named
+'wgdash'` immediately after writing the dashboard configuration, update this
+branch and run `bash scripts/middle-vps.sh finish-dashboard` on the middle VPS.
+This guarded recovery is only for that partial installation: it refuses to run
+if a dashboard database or service already exists, and it does not rebuild or
+restart the tunnel. Enter a dashboard admin password when prompted. If the guard
+refuses, inspect the existing dashboard state instead of deleting its data.
