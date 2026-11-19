@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Switch wgexit between separately installed transports with timed recovery.
+
+Requires the companion installation and systemd. Never changes firewall rules.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, '/usr/local/libexec/waterwall-wg')
+from waterwall_switch_transaction import Snapshot, switch_under_lock
+
+STATE = Path('/var/lib/waterwall-wg')
+CONF = Path('/etc/wireguard/wgexit.conf')
+CLI = '/usr/local/sbin/tunnel'
+MODES = {'wstunnel': ('127.0.0.1:40962', 'vps-wstunnel-middle'),
+         'reality-mux': ('127.0.0.1:40970', 'waterwall-wg-middle-reality-mux'),
+         'reality': ('127.0.0.1:40971', 'waterwall-wg-middle-reality'),
+         'tls-mux': ('127.0.0.1:40972', 'waterwall-wg-middle-tls-mux')}
+ENDPOINT = re.compile(r'(?m)^(\s*Endpoint[ \t]*=[ \t]*)(127\.0\.0\.1:[0-9]+)([ \t]*)$')
+SAVECONFIG = re.compile(r'(?im)^\s*SaveConfig\s*=\s*true\s*$')
+TOKEN = re.compile(r'^[a-f0-9]{24}$')
+
+
+def command(*args, check=True, timeout=15):
+    return subprocess.run(args, check=check, timeout=timeout, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+
+
+def read_config():
+    st = CONF.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0:
+        raise RuntimeError('wgexit.conf must be a root-owned regular file')
+    raw = CONF.read_text()
+    if SAVECONFIG.search(raw):
+        raise RuntimeError('SaveConfig=true is unsupported; configuration could be overwritten')
+    lines = list(ENDPOINT.finditer(raw))
+    if len(lines) != 1 or len(re.findall(r'(?im)^\s*Endpoint\s*=', raw)) != 1:
+        raise RuntimeError('expected exactly one supported localhost Endpoint in wgexit.conf')
+    return raw, lines[0].group(2), st
+
+
+def atomic_write(path, data, mode=0o600, owner=0, group=0):
+    fd, tmp = tempfile.mkstemp(prefix='.tunnel-', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        os.fchown(fd, owner, group)
+        with os.fdopen(fd, 'w') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def set_config_endpoint(allowed, new):
+    raw, current, st = read_config()
+    if current not in allowed:
+        raise RuntimeError(f'unexpected saved endpoint {current}; refusing overwrite')
+    if current == new:
+        return
+    changed = ENDPOINT.sub(lambda m: m.group(1) + new + m.group(3), raw, count=1)
+    before = CONF.stat()
+    if (before.st_ino, before.st_mtime_ns, before.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
+        raise RuntimeError('wgexit.conf changed during switch')
+    atomic_write(CONF, changed, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+
+def one_peer():
+    peers = command('wg', 'show', 'wgexit', 'peers').stdout.split()
+    if len(peers) != 1 or not re.fullmatch(r'[A-Za-z0-9+/]{43}=', peers[0]):
+        raise RuntimeError('expected exactly one wgexit peer')
+    return peers[0]
+
+
+def live_endpoint(peer):
+    rows = [line.split() for line in command('wg', 'show', 'wgexit', 'endpoints').stdout.splitlines()]
+    matches = [r[1] for r in rows if len(r) == 2 and r[0] == peer]
+    if len(matches) != 1:
+        raise RuntimeError('cannot determine live WireGuard endpoint')
+    return matches[0]
+
+
+def counters(peer):
+    rows = [line.split() for line in command('wg', 'show', 'wgexit', 'transfer').stdout.splitlines()]
+    matches = [r for r in rows if len(r) == 3 and r[0] == peer]
+    if len(matches) != 1:
+        raise RuntimeError('cannot determine WireGuard counters')
+    return int(matches[0][1]), int(matches[0][2])
+
+
+class LinuxBackend:
+    def __init__(self, target):
+        self.target = target
+        self.peer = None
+        self.old_endpoint = None
+        self.token = None
+
+    @property
+    def state_path(self):
+        return STATE / 'pending.json'
+
+    def preflight(self, target):
+        if self.state_path.exists():
+            raise RuntimeError('pending recovery exists; run tunnel status, then tunnel rollback if necessary')
+        self.peer = one_peer()
+        _, saved, _ = read_config()
+        live = live_endpoint(self.peer)
+        if live != saved or saved not in [x[0] for x in MODES.values()]:
+            raise RuntimeError('live and saved endpoints differ or are not managed; refusing switch')
+        self.old_endpoint = saved
+        if command('systemctl', 'is-active', '--quiet', MODES[target][1], check=False).returncode:
+            raise RuntimeError(f'target service {MODES[target][1]} is not active')
+        if command('systemctl', 'is-active', '--quiet', 'vps-wstunnel-middle', check=False).returncode:
+            raise RuntimeError('wstunnel backup service is not active')
+        route = command('ip', '-4', 'route', 'get', '1.1.1.1', 'from', '10.89.0.1').stdout
+        if not re.search(r'\bdev\s+wgexit\b', route):
+            raise RuntimeError('client source policy route is not via wgexit')
+
+    def snapshot(self):
+        self.token = secrets.token_hex(12)
+        old_mode = next(mode for mode, value in MODES.items() if value[0] == self.old_endpoint)
+        data = {'token': self.token, 'peer': self.peer, 'old_endpoint': self.old_endpoint,
+                'new_endpoint': MODES[self.target][0], 'old_mode': old_mode}
+        atomic_write(self.state_path, json.dumps(data) + '\n')
+        return Snapshot(self.token, old_mode)
+
+    def arm_rollback(self, snap):
+        command('systemd-run', '--quiet', '--collect', f'--unit=ww-recover-{snap.token}',
+                '--on-active=120s', '--timer-property=AccuracySec=1s', CLI, '__rollback', snap.token)
+
+    def set_live(self, target):
+        command('wg', 'set', 'wgexit', 'peer', self.peer, 'endpoint', MODES[target][0])
+
+    def verify_connectivity(self, target):
+        if live_endpoint(self.peer) != MODES[target][0]:
+            return False
+        before_rx, before_tx = counters(self.peer)
+        # Connect directly to an IP; the source policy route was checked above.
+        result = command('curl', '-4', '--silent', '--show-error', '--fail', '--noproxy', '*',
+                         '--interface', '10.89.0.1', '--connect-timeout', '8', '--max-time', '25',
+                         '-o', '/dev/null', 'https://1.1.1.1/cdn-cgi/trace', check=False, timeout=30)
+        after_rx, after_tx = counters(self.peer)
+        return result.returncode == 0 and after_rx > before_rx and after_tx > before_tx and live_endpoint(self.peer) == MODES[target][0]
+
+    def persist(self, target):
+        if live_endpoint(self.peer) != MODES[target][0]:
+            raise RuntimeError('live endpoint changed during health check')
+        set_config_endpoint({self.old_endpoint}, MODES[target][0])
+
+    def restore(self, snap):
+        data = read_pending(snap.token)
+        if one_peer() != data['peer']:
+            raise RuntimeError('WireGuard peer changed; refusing automatic rollback')
+        current = live_endpoint(data['peer'])
+        if current not in (data['old_endpoint'], data['new_endpoint']):
+            raise RuntimeError('live endpoint changed externally; refusing overwrite')
+        command('wg', 'set', 'wgexit', 'peer', data['peer'], 'endpoint', data['old_endpoint'])
+        set_config_endpoint({data['old_endpoint'], data['new_endpoint']}, data['old_endpoint'])
+
+    def disarm_rollback(self, snap):
+        # --no-block avoids waiting on a recovery service that may be waiting for our lock.
+        command('systemctl', 'stop', '--no-block', f'ww-recover-{snap.token}.timer')
+
+    def discard_snapshot(self, snap):
+        read_pending(snap.token)
+        self.state_path.unlink()
+
+
+def read_pending(token=None):
+    path = STATE / 'pending.json'
+    data = json.loads(path.read_text())
+    if not TOKEN.fullmatch(data.get('token', '')) or (token and data['token'] != token):
+        raise RuntimeError('invalid or stale recovery token')
+    if data.get('old_endpoint') not in [x[0] for x in MODES.values()] or data.get('new_endpoint') not in [x[0] for x in MODES.values()]:
+        raise RuntimeError('invalid recovery endpoints')
+    if not re.fullmatch(r'[A-Za-z0-9+/]{43}=', data.get('peer', '')):
+        raise RuntimeError('invalid recovery peer')
+    return data
+
+
+def main():
+    if os.geteuid() != 0:
+        raise RuntimeError('run as root')
+    if not STATE.is_dir() or STATE.is_symlink():
+        raise RuntimeError('WaterWall middle installation is not complete')
+    with open(STATE / 'switch.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if sys.argv[1:] == ['status']:
+            peer = one_peer()
+            _, saved, _ = read_config()
+            print('live:', live_endpoint(peer), '| saved:', saved)
+            print('recovery:', 'pending' if (STATE / 'pending.json').exists() else 'none')
+        elif len(sys.argv) == 3 and sys.argv[1] == 'switch' and sys.argv[2] in MODES:
+            print('Switching temporarily; clients may disconnect. Recovery timer: 120 seconds.', flush=True)
+            switch_under_lock(LinuxBackend(sys.argv[2]), sys.argv[2])
+            print('Health check passed and endpoint saved. Test an actual VPN client too.')
+        elif sys.argv[1:] == ['rollback'] or (len(sys.argv) == 3 and sys.argv[1] == '__rollback' and TOKEN.fullmatch(sys.argv[2])):
+            if not (STATE / 'pending.json').exists() and sys.argv[1] == '__rollback':
+                return
+            token = sys.argv[2] if len(sys.argv) == 3 else None
+            data = read_pending(token)
+            backend = LinuxBackend('wstunnel')
+            snap = Snapshot(data['token'], data['old_mode'])
+            backend.restore(snap)
+            if sys.argv[1] == 'rollback':
+                backend.disarm_rollback(snap)
+            backend.discard_snapshot(snap)
+            print('Previous endpoint restored; verify client connectivity.')
+        else:
+            raise RuntimeError('Usage: tunnel switch {reality-mux|reality|tls-mux|wstunnel} | tunnel status | tunnel rollback')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('tunnel error:', exc, file=sys.stderr)
+        sys.exit(1)

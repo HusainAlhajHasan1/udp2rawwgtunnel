@@ -142,3 +142,10 @@ refuses, inspect the existing dashboard state instead of deleting its data.
 See [WSTUNNEL-TRIAL.md](WSTUNNEL-TRIAL.md). The trial needs a DNS-only TLS
 name, an existing trusted certificate, and a separate port. It is not tested
 against the live VPSs and does not replace or disable the original tunnel.
+
+## Experimental WaterWall alternative
+
+See [WATERWALL-TRIAL.md](WATERWALL-TRIAL.md) for the isolated installers,
+switching, recovery, and important test limitations. The scripts are not yet
+validated with a real systemd manager or on the production VPSs; adding services
+on a shared host carries risk and should not be treated as disruption-free.
